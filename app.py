@@ -8,92 +8,30 @@ import gdown
 import pandas as pd
 import base64
 import io
-import requests
 from datetime import datetime, timezone
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure
 
 st.set_page_config(page_title="מערכת לזיהוי מחלות צמחים 🌾", page_icon="🌾", layout="wide")
 
 # ─────────────────────────────────────────
-# MongoDB Atlas Data API (no pymongo needed)
+# MongoDB Connection
 # ─────────────────────────────────────────
 
-API_URL      = st.secrets["ATLAS_API_URL"]       # e.g. https://data.mongodb-api.com/app/data-xxxxx/endpoint/data/v1
-API_KEY      = st.secrets["ATLAS_API_KEY"]        # Data API key from Atlas
-DB_NAME      = st.secrets.get("ATLAS_DB_NAME", "wheat_disease_db")
-DATA_SOURCE  = st.secrets.get("ATLAS_CLUSTER_NAME", "Cluster0")
-
-HEADERS = {
-    "Content-Type": "application/json",
-    "api-key": API_KEY,
-}
-
-def _post(action: str, collection: str, body: dict) -> dict:
-    url = f"{API_URL}/action/{action}"
-    payload = {"dataSource": DATA_SOURCE, "database": DB_NAME, "collection": collection, **body}
-    r = requests.post(url, json=payload, headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    return r.json()
-
-# ── Plants ──
-
-def get_all_plants() -> list:
-    res = _post("find", "plants", {"sort": {"id": 1}, "limit": 1000})
-    docs = res.get("documents", [])
-    for d in docs:
-        d.pop("_id", None)
-    return docs
-
-def upsert_plants_from_df(df: pd.DataFrame):
-    _post("deleteMany", "plants", {"filter": {}})
-    records = df.to_dict(orient="records")
-    if records:
-        _post("insertMany", "plants", {"documents": records})
-
-# ── Diagnoses ──
-
-def save_diagnosis(plant_id: int, plant_name: str, image: Image.Image,
-                   class_name: str, diagnosis_heb: str, notes: str):
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    doc = {
-        "plant_id":   plant_id,
-        "plant_name": plant_name,
-        "class_name": class_name,
-        "diagnosis":  diagnosis_heb,
-        "notes":      notes,
-        "image_b64":  img_b64,
-        "timestamp":  datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    _post("insertOne", "diagnoses", {"document": doc})
-
-def load_diagnoses(plant_id: int) -> list:
-    res = _post("find", "diagnoses",
-                {"filter": {"plant_id": plant_id}, "sort": {"created_at": 1}, "limit": 500})
-    docs = res.get("documents", [])
-    for d in docs:
-        d.pop("_id", None)
-    return docs
-
-def delete_diagnosis(plant_id: int, timestamp: str):
-    _post("deleteOne", "diagnoses", {"filter": {"plant_id": plant_id, "timestamp": timestamp}})
-
-def count_collection(collection: str) -> int:
-    res = _post("find", collection, {"limit": 0})
-    return len(res.get("documents", []))
-
-# ── Connection test ──
-
 @st.cache_resource
-def test_connection():
+def get_db():
+    uri = st.secrets["MONGODB_URI"]
+    client = MongoClient(uri)
     try:
-        _post("find", "plants", {"limit": 1})
-        return True
-    except Exception as e:
-        return str(e)
+        client.admin.command("ping")
+    except ConnectionFailure:
+        st.error("❌ לא ניתן להתחבר ל-MongoDB.")
+        st.stop()
+    return client["wheat_disease_db"]
 
-conn_status = test_connection()
+db            = get_db()
+plants_col    = db["plants"]
+diagnoses_col = db["diagnoses"]
 
 # ─────────────────────────────────────────
 # Page Navigation
@@ -149,8 +87,9 @@ st.markdown("""
     text-align: center !important; margin-bottom: 40px !important;
 }
 .db-badge {
-    display: inline-block; border-radius: 20px; padding: 4px 14px;
-    font-size: 0.85rem; font-weight: 600; margin-bottom: 8px;
+    display: inline-block; background: #e8f5e9; color: #2e7d32;
+    border-radius: 20px; padding: 4px 14px; font-size: 0.85rem;
+    font-weight: 600; margin-bottom: 8px;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -192,6 +131,42 @@ DISEASE_INFO = {
 }
 
 # ─────────────────────────────────────────
+# DB Helper Functions
+# ─────────────────────────────────────────
+
+def get_all_plants():
+    docs = list(plants_col.find({}, {"_id": 0}).sort("id", 1))
+    return docs
+
+def upsert_plants_from_df(df: pd.DataFrame):
+    plants_col.delete_many({})
+    records = df.to_dict(orient="records")
+    if records:
+        plants_col.insert_many(records)
+
+def save_diagnosis(plant_id, plant_name, image, class_name, diagnosis_heb, notes):
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    doc = {
+        "plant_id":   plant_id,
+        "plant_name": plant_name,
+        "class_name": class_name,
+        "diagnosis":  diagnosis_heb,
+        "notes":      notes,
+        "image_b64":  img_b64,
+        "timestamp":  datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        "created_at": datetime.now(timezone.utc),
+    }
+    diagnoses_col.insert_one(doc)
+
+def load_diagnoses(plant_id):
+    return list(diagnoses_col.find({"plant_id": plant_id}, {"_id": 0}).sort("created_at", 1))
+
+def delete_diagnosis(plant_id, timestamp):
+    diagnoses_col.delete_one({"plant_id": plant_id, "timestamp": timestamp})
+
+# ─────────────────────────────────────────
 # Model
 # ─────────────────────────────────────────
 
@@ -220,7 +195,7 @@ transform = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-def run_model(image: Image.Image):
+def run_model(image):
     if model is None:
         return None, None
     with torch.no_grad():
@@ -239,14 +214,7 @@ if st.session_state.page == "home":
     st.markdown("<br><br>", unsafe_allow_html=True)
     st.markdown("<div class='main-title'>מערכת מתקדמת לזיהוי מחלות צמחים</div>", unsafe_allow_html=True)
     st.markdown("<div class='subtitle'>מבצעים: נבו הלר ומתן אדר | מנחה: אסי ברק</div>", unsafe_allow_html=True)
-
-    badge_color = "#e8f5e9" if conn_status is True else "#fdecea"
-    badge_text_color = "#2e7d32" if conn_status is True else "#c62828"
-    badge_label = "🟢 מחובר ל-MongoDB Atlas" if conn_status is True else f"🔴 שגיאת חיבור: {conn_status}"
-    st.markdown(
-        f"<div style='text-align:center'>"
-        f"<span class='db-badge' style='background:{badge_color};color:{badge_text_color}'>{badge_label}</span>"
-        f"</div>", unsafe_allow_html=True)
+    st.markdown("<div style='text-align:center'><span class='db-badge'>🟢 מחובר ל-MongoDB Atlas</span></div>", unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
     col1, col2, col3 = st.columns(3, gap="large")
@@ -353,7 +321,7 @@ elif st.session_state.page == "experiment_management":
                            index=st.session_state.current_plant_idx, key="psel")
         st.session_state.current_plant_idx = labels_list.index(sel)
 
-    plant = plants[st.session_state.current_plant_idx]
+    plant      = plants[st.session_state.current_plant_idx]
     plant_id   = int(plant["id"])
     plant_name = str(plant["name"])
 
@@ -397,8 +365,7 @@ elif st.session_state.page == "experiment_management":
 
     st.divider()
     st.subheader("📋 נתוני הצמח המלאים")
-    display_plant = {k: v for k, v in plant.items()}
-    st.dataframe(pd.DataFrame([display_plant]), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame([plant]), use_container_width=True, hide_index=True)
 
     st.divider()
     st.subheader("📸 הוספת אבחון חדש")
@@ -416,7 +383,7 @@ elif st.session_state.page == "experiment_management":
             image = Image.open(img_file).convert("RGB")
             class_name, _ = run_model(image)
             if class_name is None:
-                auto_diag = "לא זוהה עלה רלוונטי"
+                auto_diag  = "לא זוהה עלה רלוונטי"
                 class_name = "Unknown"
             else:
                 auto_diag = DISEASE_INFO.get(class_name, {"heb": class_name})["heb"]
@@ -487,15 +454,16 @@ elif st.session_state.page == "data_management":
     st.divider()
     st.subheader("📊 סטטוס מסד הנתונים")
     with st.container(border=True):
-        with st.spinner("טוען סטטיסטיקות..."):
-            all_plants    = get_all_plants()
-            all_diagnoses = _post("find", "diagnoses",
-                                  {"sort": {"created_at": -1}, "limit": 1, "projection": {"timestamp": 1, "_id": 0}})
-            last_ts = (all_diagnoses.get("documents") or [{}])[0].get("timestamp", "אין")
+        with st.spinner("טוען..."):
+            plant_count    = plants_col.count_documents({})
+            diagnosis_count = diagnoses_col.count_documents({})
+            last_diag = diagnoses_col.find_one({}, {"timestamp": 1, "_id": 0},
+                                               sort=[("created_at", -1)])
+            last_ts = last_diag["timestamp"] if last_diag else "אין"
         s1, s2, s3 = st.columns(3)
-        s1.metric("🌱 צמחים ב-DB", len(all_plants))
-        s2.metric("🔬 אבחון אחרון", last_ts)
-        s3.metric("🔗 סטטוס חיבור", "✅ מחובר" if conn_status is True else "❌ שגיאה")
+        s1.metric("🌱 צמחים ב-DB", plant_count)
+        s2.metric("🔬 סה\"כ אבחונים", diagnosis_count)
+        s3.metric("🕐 אבחון אחרון", last_ts)
 
     st.divider()
     st.subheader("📤 ייצוא נתונים")
@@ -506,17 +474,18 @@ elif st.session_state.page == "data_management":
                 plants_exp = get_all_plants()
                 if plants_exp:
                     csv_data = pd.DataFrame(plants_exp).to_csv(index=False).encode("utf-8")
-                    st.download_button("⬇️ הורד plants.csv", csv_data, "plants.csv", "text/csv", use_container_width=True)
+                    st.download_button("⬇️ הורד plants.csv", csv_data,
+                                       "plants.csv", "text/csv", use_container_width=True)
                 else:
                     st.warning("אין נתונים.")
         with ec2:
             if st.button("📥 ייצא אבחונים כ-CSV", use_container_width=True):
-                all_d = _post("find", "diagnoses",
-                              {"limit": 1000, "projection": {"image_b64": 0, "_id": 0}})
-                docs = all_d.get("documents", [])
+                docs = list(diagnoses_col.find({}, {"_id": 0, "image_b64": 0})
+                            .sort("created_at", 1))
                 if docs:
                     csv_diag = pd.DataFrame(docs).to_csv(index=False).encode("utf-8")
-                    st.download_button("⬇️ הורד diagnoses.csv", csv_diag, "diagnoses.csv", "text/csv", use_container_width=True)
+                    st.download_button("⬇️ הורד diagnoses.csv", csv_diag,
+                                       "diagnoses.csv", "text/csv", use_container_width=True)
                 else:
                     st.warning("אין אבחונים.")
 
@@ -526,11 +495,11 @@ elif st.session_state.page == "data_management":
         d1, d2 = st.columns(2)
         with d1:
             if st.button("🗑️ מחק את כל האבחונים", use_container_width=True):
-                _post("deleteMany", "diagnoses", {"filter": {}})
+                diagnoses_col.delete_many({})
                 st.success("כל האבחונים נמחקו.")
                 st.rerun()
         with d2:
             if st.button("🗑️ מחק את כל נתוני הצמחים", use_container_width=True):
-                _post("deleteMany", "plants", {"filter": {}})
+                plants_col.delete_many({})
                 st.success("כל נתוני הצמחים נמחקו.")
                 st.rerun()
