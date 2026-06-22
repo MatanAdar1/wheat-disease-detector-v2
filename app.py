@@ -23,7 +23,23 @@ st.set_page_config(page_title="מערכת לזיהוי מחלות צמחים �
 def get_db():
     """Connect to MongoDB Atlas. Connection string loaded from st.secrets."""
     uri = st.secrets["MONGODB_URI"]
-    client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+
+    # Python 3.14 fix: resolve SRV manually if needed
+    if uri.startswith("mongodb+srv://"):
+        try:
+            import dns.resolver
+            # Parse host from SRV URI
+            host = uri.split("@")[-1].split("/")[0].split("?")[0]
+            srv_records = dns.resolver.resolve(f"_mongodb._tcp.{host}", "SRV")
+            hosts = [f"{r.target}:{r.port}" for r in srv_records]
+            # Rebuild as standard URI
+            creds = uri.split("@")[0].replace("mongodb+srv://", "")
+            db_part = uri.split("/")[-1] if "/" in uri.split("@")[-1] else ""
+            uri = f"mongodb://{creds}@{','.join(hosts)}/{db_part}?ssl=true&authSource=admin"
+        except Exception:
+            pass  # Fall through to original URI if DNS resolution fails
+
+    client = MongoClient(uri, serverSelectionTimeoutMS=8000, tls=True)
     try:
         client.admin.command("ping")
     except ConnectionFailure:
