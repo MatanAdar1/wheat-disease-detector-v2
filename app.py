@@ -25,7 +25,7 @@ def get_db():
     try:
         client.admin.command("ping")
     except ConnectionFailure:
-        st.error("❌ לא ניתן להתחבר ל-MongoDB.")
+        st.error("❌ שגיאה בחיבור למערכת. אנא פנה למנהל המערכת.")
         st.stop()
     return client["wheat_disease_db"]
 
@@ -214,7 +214,7 @@ if st.session_state.page == "home":
     st.markdown("<br><br>", unsafe_allow_html=True)
     st.markdown("<div class='main-title'>מערכת מתקדמת לזיהוי מחלות צמחים</div>", unsafe_allow_html=True)
     st.markdown("<div class='subtitle'>מבצעים: נבו הלר ומתן אדר | מנחה: אסי ברק</div>", unsafe_allow_html=True)
-    st.markdown("<div style='text-align:center'><span class='db-badge'>🟢 מחובר ל-MongoDB Atlas</span></div>", unsafe_allow_html=True)
+    st.markdown("<div style='text-align:center'><span class='db-badge'>🟢 מערכת פעילה ומוכנה לשימוש</span></div>", unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
     col1, col2, col3 = st.columns(3, gap="large")
@@ -234,7 +234,7 @@ if st.session_state.page == "home":
           <span style='font-size:3.5rem'>📊</span>
           <h3 style='color:#2e7d32;margin-top:15px'>ניהול ומעקב ניסוי</h3>
           <p style='color:#666;font-size:1rem;line-height:1.6'>
-            ניהול צמחי הניסוי, תיעוד אבחונים — הכל מסונכרן ב-MongoDB.</p>
+            ניהול צמחי הניסוי, תיעוד אבחונים — נתוני הצמחים, האבחונים והתמונות נשמרים ומסונכרנים בין כל המשתמשים.</p>
         </div>""", unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("פתח מערכת ניסוי 🔬", use_container_width=True, key="btn_exp", type="primary"):
@@ -245,7 +245,7 @@ if st.session_state.page == "home":
           <span style='font-size:3.5rem'>⚙️</span>
           <h3 style='color:#6a1b9a;margin-top:15px'>ניהול נתונים</h3>
           <p style='color:#666;font-size:1rem;line-height:1.6'>
-            עדכון CSV של הניסוי בלחיצת כפתור — ללא גיטהאב, ללא רענון ידני.</p>
+            עדכון וניהול נתוני הניסוי, ייצוא דוחות ותחזוקת המערכת.</p>
         </div>""", unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("ניהול נתונים ⚙️", use_container_width=True, key="btn_admin", type="primary"):
@@ -259,7 +259,7 @@ elif st.session_state.page == "single_diagnosis":
     if st.button("🔙 חזרה לדף הבית", key="back1"):
         st.session_state.page = "home"; st.rerun()
     st.markdown("<h2 style='color:#1565c0'>📸 אבחון חזותי מהיר</h2>", unsafe_allow_html=True)
-    st.write("בדיקה מיידית של עלה נגוע — ללא קישור לניסוי")
+    st.write("העלאת תמונת עלה לזיהוי מחלה ידני — ללא שיוך לצמח ספציפי בניסוי")
     st.divider()
 
     c1, c2 = st.columns([1, 1], gap="large")
@@ -299,11 +299,11 @@ elif st.session_state.page == "experiment_management":
     st.markdown("<h2 style='color:#2e7d32'>📊 מערכת ניהול ניסוי החיטה</h2>", unsafe_allow_html=True)
     st.divider()
 
-    with st.spinner("טוען נתוני צמחים..."):
+    with st.spinner("טוען נתונים..."):
         plants = get_all_plants()
 
     if not plants:
-        st.warning("⚠️ אין נתוני צמחים. עבור ל'ניהול נתונים' כדי להעלות CSV.")
+        st.warning("⚠️ טרם נטענו נתוני ניסוי. יש לעבור לדף ניהול הנתונים ולהעלות קובץ נתונים.")
         st.stop()
 
     labels_list = [f"ID: {p['id']} | שם: {p['name']}" for p in plants]
@@ -325,7 +325,7 @@ elif st.session_state.page == "experiment_management":
     plant_id   = int(plant["id"])
     plant_name = str(plant["name"])
 
-    with st.spinner("טוען היסטוריית אבחונים..."):
+    with st.spinner("טוען היסטוריה..."):
         history = load_diagnoses(plant_id)
 
     st.markdown("<br>", unsafe_allow_html=True)
@@ -388,11 +388,11 @@ elif st.session_state.page == "experiment_management":
             else:
                 auto_diag = DISEASE_INFO.get(class_name, {"heb": class_name})["heb"]
             st.markdown(f"**🔍 תוצאת ניתוח:** {auto_diag}")
-            if st.button("💾 שמור אבחון ל-MongoDB", use_container_width=True, type="primary"):
-                with st.spinner("שומר..."):
+            if st.button("💾 שמור אבחון", use_container_width=True, type="primary"):
+                with st.spinner("שומר אבחון..."):
                     save_diagnosis(plant_id, plant_name, image, class_name, auto_diag,
                                    notes if notes else "לא הוכנס פירוט")
-                st.success("✅ נשמר בהצלחה ב-MongoDB Atlas!")
+                st.success("✅ האבחון נשמר בהצלחה!")
                 st.rerun()
 
     st.divider()
@@ -432,9 +432,9 @@ elif st.session_state.page == "data_management":
     st.markdown("<h2 style='color:#6a1b9a'>⚙️ ניהול נתוני הניסוי</h2>", unsafe_allow_html=True)
     st.divider()
 
-    st.subheader("📥 עדכון נתוני צמחים מ-CSV")
+    st.subheader("📥 עדכון נתוני הניסוי")
     with st.container(border=True):
-        st.write("העלה קובץ CSV חדש — הנתונים יוחלפו ב-MongoDB מיידית, ללא deploy.")
+        st.write("העלאת קובץ נתונים מעודכן. לאחר האישור הנתונים יעודכנו בכל המערכת.")
         csv_file = st.file_uploader("בחר קובץ CSV", type=["csv"], key="csv_upload")
         if csv_file:
             df = pd.read_csv(csv_file)
@@ -442,17 +442,17 @@ elif st.session_state.page == "data_management":
             st.write(f"סה\"כ: **{len(df)}** שורות, **{len(df.columns)}** עמודות")
             col_a, col_b = st.columns(2)
             with col_a:
-                if st.button("✅ אשר והעלה ל-MongoDB", type="primary", use_container_width=True):
-                    with st.spinner("מעלה נתונים..."):
+                if st.button("✅ אשר ועדכן נתונים", type="primary", use_container_width=True):
+                    with st.spinner("מעדכן נתונים..."):
                         upsert_plants_from_df(df)
-                    st.success(f"✅ {len(df)} צמחים עודכנו בהצלחה!")
+                    st.success(f"✅ הנתונים עודכנו בהצלחה!")
                     st.balloons()
             with col_b:
                 if st.button("❌ ביטול", use_container_width=True):
                     st.rerun()
 
     st.divider()
-    st.subheader("📊 סטטוס מסד הנתונים")
+    st.subheader("📊 סטטוס הניסוי")
     with st.container(border=True):
         with st.spinner("טוען..."):
             plant_count    = plants_col.count_documents({})
@@ -461,7 +461,7 @@ elif st.session_state.page == "data_management":
                                                sort=[("created_at", -1)])
             last_ts = last_diag["timestamp"] if last_diag else "אין"
         s1, s2, s3 = st.columns(3)
-        s1.metric("🌱 צמחים ב-DB", plant_count)
+        s1.metric("🌱 צמחים בניסוי", plant_count)
         s2.metric("🔬 סה\"כ אבחונים", diagnosis_count)
         s3.metric("🕐 אבחון אחרון", last_ts)
 
