@@ -6,50 +6,94 @@ from PIL import Image
 import os
 import gdown
 import pandas as pd
-import json
 import base64
 import io
-from datetime import datetime
-from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure
+import requests
+from datetime import datetime, timezone
 
 st.set_page_config(page_title="מערכת לזיהוי מחלות צמחים 🌾", page_icon="🌾", layout="wide")
 
 # ─────────────────────────────────────────
-# MongoDB Connection
+# MongoDB Atlas Data API (no pymongo needed)
 # ─────────────────────────────────────────
 
+API_URL      = st.secrets["ATLAS_API_URL"]       # e.g. https://data.mongodb-api.com/app/data-xxxxx/endpoint/data/v1
+API_KEY      = st.secrets["ATLAS_API_KEY"]        # Data API key from Atlas
+DB_NAME      = st.secrets.get("ATLAS_DB_NAME", "wheat_disease_db")
+DATA_SOURCE  = st.secrets.get("ATLAS_CLUSTER_NAME", "Cluster0")
+
+HEADERS = {
+    "Content-Type": "application/json",
+    "api-key": API_KEY,
+}
+
+def _post(action: str, collection: str, body: dict) -> dict:
+    url = f"{API_URL}/action/{action}"
+    payload = {"dataSource": DATA_SOURCE, "database": DB_NAME, "collection": collection, **body}
+    r = requests.post(url, json=payload, headers=HEADERS, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+# ── Plants ──
+
+def get_all_plants() -> list:
+    res = _post("find", "plants", {"sort": {"id": 1}, "limit": 1000})
+    docs = res.get("documents", [])
+    for d in docs:
+        d.pop("_id", None)
+    return docs
+
+def upsert_plants_from_df(df: pd.DataFrame):
+    _post("deleteMany", "plants", {"filter": {}})
+    records = df.to_dict(orient="records")
+    if records:
+        _post("insertMany", "plants", {"documents": records})
+
+# ── Diagnoses ──
+
+def save_diagnosis(plant_id: int, plant_name: str, image: Image.Image,
+                   class_name: str, diagnosis_heb: str, notes: str):
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    doc = {
+        "plant_id":   plant_id,
+        "plant_name": plant_name,
+        "class_name": class_name,
+        "diagnosis":  diagnosis_heb,
+        "notes":      notes,
+        "image_b64":  img_b64,
+        "timestamp":  datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _post("insertOne", "diagnoses", {"document": doc})
+
+def load_diagnoses(plant_id: int) -> list:
+    res = _post("find", "diagnoses",
+                {"filter": {"plant_id": plant_id}, "sort": {"created_at": 1}, "limit": 500})
+    docs = res.get("documents", [])
+    for d in docs:
+        d.pop("_id", None)
+    return docs
+
+def delete_diagnosis(plant_id: int, timestamp: str):
+    _post("deleteOne", "diagnoses", {"filter": {"plant_id": plant_id, "timestamp": timestamp}})
+
+def count_collection(collection: str) -> int:
+    res = _post("find", collection, {"limit": 0})
+    return len(res.get("documents", []))
+
+# ── Connection test ──
+
 @st.cache_resource
-def get_db():
-    """Connect to MongoDB Atlas. Connection string loaded from st.secrets."""
-    uri = st.secrets["MONGODB_URI"]
-
-    # Python 3.14 fix: resolve SRV manually if needed
-    if uri.startswith("mongodb+srv://"):
-        try:
-            import dns.resolver
-            # Parse host from SRV URI
-            host = uri.split("@")[-1].split("/")[0].split("?")[0]
-            srv_records = dns.resolver.resolve(f"_mongodb._tcp.{host}", "SRV")
-            hosts = [f"{r.target}:{r.port}" for r in srv_records]
-            # Rebuild as standard URI
-            creds = uri.split("@")[0].replace("mongodb+srv://", "")
-            db_part = uri.split("/")[-1] if "/" in uri.split("@")[-1] else ""
-            uri = f"mongodb://{creds}@{','.join(hosts)}/{db_part}?ssl=true&authSource=admin"
-        except Exception:
-            pass  # Fall through to original URI if DNS resolution fails
-
-    client = MongoClient(uri, serverSelectionTimeoutMS=8000, tls=True)
+def test_connection():
     try:
-        client.admin.command("ping")
-    except ConnectionFailure:
-        st.error("❌ לא ניתן להתחבר ל-MongoDB. בדוק את ה-connection string ב-secrets.")
-        st.stop()
-    return client["wheat_disease_db"]
+        _post("find", "plants", {"limit": 1})
+        return True
+    except Exception as e:
+        return str(e)
 
-db = get_db()
-plants_col   = db["plants"]
-diagnoses_col = db["diagnoses"]
+conn_status = test_connection()
 
 # ─────────────────────────────────────────
 # Page Navigation
@@ -77,7 +121,6 @@ st.markdown("""
     text-align: right !important; direction: rtl !important;
 }
 [data-testid="stDataFrame"] { direction: rtl !important; }
-
 .custom-card {
     background: #ffffff; padding: 24px; border-radius: 12px;
     border-right: 6px solid #2e7d32; margin-bottom: 20px;
@@ -106,9 +149,8 @@ st.markdown("""
     text-align: center !important; margin-bottom: 40px !important;
 }
 .db-badge {
-    display: inline-block; background: #e8f5e9; color: #2e7d32;
-    border-radius: 20px; padding: 4px 14px; font-size: 0.85rem;
-    font-weight: 600; margin-bottom: 8px;
+    display: inline-block; border-radius: 20px; padding: 4px 14px;
+    font-size: 0.85rem; font-weight: 600; margin-bottom: 8px;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -124,75 +166,30 @@ CONFIDENCE_THRESHOLD = 0.25
 DISEASE_INFO = {
     "BlackPoint": {
         "heb": "חוד שחור (Black Point)",
-        "desc": "מחלה הנגרמת על ידי קומפלקס פטריות או תנאים סביבתיים בשלבי הבשלת הגרעין. מתאפיינת בהשחרה של קצה הגרעין, ומתפתחת בעיקר בעקבות לחות גבוהה.",
-        "tip": "מומלץ להפחית את משטר ההשקיה בשלבי ההבשלה ולמנוע לחות עודפת. שימוש בזרעים נקיים ומחוטאים בעונה הבאה."
+        "desc": "מחלה הנגרמת על ידי קומפלקס פטריות בשלבי הבשלת הגרעין. מתאפיינת בהשחרה של קצה הגרעין, ומתפתחת בעיקר בעקבות לחות גבוהה.",
+        "tip": "מומלץ להפחית את משטר ההשקיה בשלבי ההבשלה. שימוש בזרעים נקיים ומחוטאים בעונה הבאה."
     },
     "FusariumFootRot": {
         "heb": "ריקבון בסיס הקנה (Fusarium)",
-        "desc": "מחלה פטרייתית קרקעית התוקפת את מערכת השורשים ובסיס הקנה. חוסמת צינורות הובלה ומביאה לנבילה וריקבון.",
-        "tip": "יש ליישם מחזור זרעים קפדני עם גידולים שאינם דגניים למשך שנתיים לפחות. להימנע מהשקיית יתר."
+        "desc": "מחלה פטרייתית קרקעית התוקפת את השורשים ובסיס הקנה. חוסמת צינורות הובלה ומביאה לנבילה וריקבון.",
+        "tip": "יש ליישם מחזור זרעים קפדני עם גידולים שאינם דגניים למשך שנתיים. להימנע מהשקיית יתר."
     },
     "HealthyLeaf": {
         "heb": "עלה בריא (Healthy)",
-        "desc": "העלה מציג חיוניות גבוהה, צבע ירוק אחיד ושטח פנים נקי. תהליך הפוטוסינתזה מתנהל בצורה אופטימלית.",
+        "desc": "העלה מציג חיוניות גבוהה, צבע ירוק אחיד ושטח פנים נקי. הפוטוסינתזה מתנהלת בצורה אופטימלית.",
         "tip": "מצב מצוין! יש להמשיך במשטר הטיפוח הנוכחי ולשמור על ניטור שבועי."
     },
     "LeafBlight": {
         "heb": "קמלת עלים (Leaf Blight)",
-        "desc": "מחלה פטרייתית המתבטאת בכתמים מוארכים, יבשים וחומים-אפרפרים על גבי העלים. מפחיתה דרסטית את כושר הפוטוסינתזה.",
-        "tip": "מומלץ לשלב ריסוס בקוטלי פטריות עם זיהוי הסימנים הראשונים. יש להשמיד שאריות צמחים נגועות."
+        "desc": "מחלה פטרייתית המתבטאת בכתמים חומים-אפרפרים על העלים. מפחיתה דרסטית את כושר הפוטוסינתזה.",
+        "tip": "מומלץ לרסס בקוטלי פטריות עם זיהוי הסימנים הראשונים. יש להשמיד שאריות צמחים נגועות."
     },
     "WheatBlast": {
         "heb": "פיריקורליית החיטה (Wheat Blast)",
-        "desc": "מחלה פטרייתית הרסנית ביותר — השיבולת הופכת ללבנה ויבשה תוך ימים ספורים ומונעת פיתוח גרגרים.",
-        "tip": "זהו מצב חירום חקלאי. יש לבודד את האזור הנגוע מיד ולרסס בקוטלי פטריות סיסטמיים חזקים בדחיפות."
+        "desc": "מחלה פטרייתית הרסנית — השיבולת הופכת ללבנה ויבשה תוך ימים ומונעת פיתוח גרגרים.",
+        "tip": "מצב חירום חקלאי. יש לבודד את האזור הנגוע מיד ולרסס בקוטלי פטריות סיסטמיים בדחיפות."
     }
 }
-
-# ─────────────────────────────────────────
-# DB Helper Functions
-# ─────────────────────────────────────────
-
-def get_all_plants():
-    """Return all plants sorted by id."""
-    return list(plants_col.find({}, {"_id": 0}).sort("id", 1))
-
-def upsert_plants_from_df(df: pd.DataFrame):
-    """Replace plant collection with data from uploaded CSV."""
-    plants_col.delete_many({})
-    records = df.to_dict(orient="records")
-    if records:
-        plants_col.insert_many(records)
-
-def save_diagnosis(plant_id: int, plant_name: str, image: Image.Image,
-                   class_name: str, diagnosis_heb: str, notes: str):
-    """Save a diagnosis record (with image as base64) to MongoDB."""
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-    doc = {
-        "plant_id":   plant_id,
-        "plant_name": plant_name,
-        "class_name": class_name,
-        "diagnosis":  diagnosis_heb,
-        "notes":      notes,
-        "image_b64":  img_b64,
-        "timestamp":  datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-        "created_at": datetime.utcnow(),
-    }
-    diagnoses_col.insert_one(doc)
-
-def load_diagnoses(plant_id: int):
-    """Load all diagnoses for a given plant, oldest first."""
-    return list(
-        diagnoses_col.find({"plant_id": plant_id}, {"_id": 0})
-        .sort("created_at", 1)
-    )
-
-def delete_diagnosis(plant_id: int, timestamp: str):
-    """Delete a single diagnosis record by plant_id + timestamp."""
-    diagnoses_col.delete_one({"plant_id": plant_id, "timestamp": timestamp})
 
 # ─────────────────────────────────────────
 # Model
@@ -205,12 +202,12 @@ def load_wheat_model():
             gdown.download(f"https://drive.google.com/uc?id={FILE_ID}", MODEL_PATH, quiet=False)
     try:
         checkpoint = torch.load(MODEL_PATH, map_location="cpu", weights_only=False)
-        labels = checkpoint.get("classes", list(DISEASE_INFO.keys()))
-        model = models.resnet18(weights=None)
-        model.fc = nn.Linear(model.fc.in_features, len(labels))
-        model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
-        model.eval()
-        return model, labels
+        lbl = checkpoint.get("classes", list(DISEASE_INFO.keys()))
+        m = models.resnet18(weights=None)
+        m.fc = nn.Linear(m.fc.in_features, len(lbl))
+        m.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
+        m.eval()
+        return m, lbl
     except Exception as e:
         st.error(f"שגיאה בטעינת המודל: {e}")
         return None, None
@@ -224,7 +221,6 @@ transform = transforms.Compose([
 ])
 
 def run_model(image: Image.Image):
-    """Returns (class_name, confidence) or (None, None) if below threshold."""
     if model is None:
         return None, None
     with torch.no_grad():
@@ -236,68 +232,64 @@ def run_model(image: Image.Image):
     return labels[pred.item()], conf.item()
 
 # ─────────────────────────────────────────
-# ══════════  HOME PAGE  ══════════
+# HOME PAGE
 # ─────────────────────────────────────────
 
 if st.session_state.page == "home":
     st.markdown("<br><br>", unsafe_allow_html=True)
     st.markdown("<div class='main-title'>מערכת מתקדמת לזיהוי מחלות צמחים</div>", unsafe_allow_html=True)
     st.markdown("<div class='subtitle'>מבצעים: נבו הלר ומתן אדר | מנחה: אסי ברק</div>", unsafe_allow_html=True)
-    st.markdown("<div style='text-align:center'><span class='db-badge'>🟢 מחובר ל-MongoDB Atlas</span></div>", unsafe_allow_html=True)
+
+    badge_color = "#e8f5e9" if conn_status is True else "#fdecea"
+    badge_text_color = "#2e7d32" if conn_status is True else "#c62828"
+    badge_label = "🟢 מחובר ל-MongoDB Atlas" if conn_status is True else f"🔴 שגיאת חיבור: {conn_status}"
+    st.markdown(
+        f"<div style='text-align:center'>"
+        f"<span class='db-badge' style='background:{badge_color};color:{badge_text_color}'>{badge_label}</span>"
+        f"</div>", unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
     col1, col2, col3 = st.columns(3, gap="large")
-
     with col1:
-        st.markdown("""
-        <div class="home-box">
+        st.markdown("""<div class="home-box">
           <span style='font-size:3.5rem'>📸</span>
           <h3 style='color:#1565c0;margin-top:15px'>אבחון חזותי מהיר</h3>
           <p style='color:#666;font-size:1rem;line-height:1.6'>
-            בדיקה מיידית של עלה — מעלים תמונה ומקבלים אבחון והנחיות טיפול מיידיות.
-          </p>
+            בדיקה מיידית של עלה — מעלים תמונה ומקבלים אבחון והנחיות טיפול.</p>
         </div>""", unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("הפעל אבחון מהיר 🚀", use_container_width=True, key="btn_single", type="primary"):
-            st.session_state.page = "single_diagnosis"
-            st.rerun()
+            st.session_state.page = "single_diagnosis"; st.rerun()
 
     with col2:
-        st.markdown("""
-        <div class="home-box">
+        st.markdown("""<div class="home-box">
           <span style='font-size:3.5rem'>📊</span>
           <h3 style='color:#2e7d32;margin-top:15px'>ניהול ומעקב ניסוי</h3>
           <p style='color:#666;font-size:1rem;line-height:1.6'>
-            ניהול צמחי הניסוי, צפייה בנתונים, תיעוד אבחונים — הכל מסונכרן ב-MongoDB.
-          </p>
+            ניהול צמחי הניסוי, תיעוד אבחונים — הכל מסונכרן ב-MongoDB.</p>
         </div>""", unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("פתח מערכת ניסוי 🔬", use_container_width=True, key="btn_exp", type="primary"):
-            st.session_state.page = "experiment_management"
-            st.rerun()
+            st.session_state.page = "experiment_management"; st.rerun()
 
     with col3:
-        st.markdown("""
-        <div class="home-box">
+        st.markdown("""<div class="home-box">
           <span style='font-size:3.5rem'>⚙️</span>
           <h3 style='color:#6a1b9a;margin-top:15px'>ניהול נתונים</h3>
           <p style='color:#666;font-size:1rem;line-height:1.6'>
-            עדכון קובץ CSV של הניסוי בלחיצת כפתור — ללא גיטהאב, ללא רענון ידני.
-          </p>
+            עדכון CSV של הניסוי בלחיצת כפתור — ללא גיטהאב, ללא רענון ידני.</p>
         </div>""", unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("ניהול נתונים ⚙️", use_container_width=True, key="btn_admin", type="primary"):
-            st.session_state.page = "data_management"
-            st.rerun()
+            st.session_state.page = "data_management"; st.rerun()
 
 # ─────────────────────────────────────────
-# ══════════  QUICK DIAGNOSIS  ══════════
+# QUICK DIAGNOSIS
 # ─────────────────────────────────────────
 
 elif st.session_state.page == "single_diagnosis":
     if st.button("🔙 חזרה לדף הבית", key="back1"):
         st.session_state.page = "home"; st.rerun()
-
     st.markdown("<h2 style='color:#1565c0'>📸 אבחון חזותי מהיר</h2>", unsafe_allow_html=True)
     st.write("בדיקה מיידית של עלה נגוע — ללא קישור לניסוי")
     st.divider()
@@ -310,7 +302,6 @@ elif st.session_state.page == "single_diagnosis":
             img_file = (st.camera_input("צלם עלה", key="sc")
                         if "מצלמה" in method
                         else st.file_uploader("בחר קובץ", type=["jpg","png","jpeg"], key="su"))
-
     with c2:
         if img_file:
             image = Image.open(img_file).convert("RGB")
@@ -331,23 +322,23 @@ elif st.session_state.page == "single_diagnosis":
                 </div>""", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────
-# ══════════  EXPERIMENT MANAGEMENT  ══════
+# EXPERIMENT MANAGEMENT
 # ─────────────────────────────────────────
 
 elif st.session_state.page == "experiment_management":
     if st.button("🔙 חזרה לדף הבית", key="back2"):
         st.session_state.page = "home"; st.rerun()
-
     st.markdown("<h2 style='color:#2e7d32'>📊 מערכת ניהול ניסוי החיטה</h2>", unsafe_allow_html=True)
     st.divider()
 
-    plants = get_all_plants()
+    with st.spinner("טוען נתוני צמחים..."):
+        plants = get_all_plants()
+
     if not plants:
-        st.warning("⚠️ אין נתוני צמחים במסד הנתונים. עבור ל'ניהול נתונים' כדי להעלות CSV.")
+        st.warning("⚠️ אין נתוני צמחים. עבור ל'ניהול נתונים' כדי להעלות CSV.")
         st.stop()
 
     labels_list = [f"ID: {p['id']} | שם: {p['name']}" for p in plants]
-
     nav1, nav2, nav3 = st.columns([1, 2, 1])
     with nav1:
         if st.button("➡️ הקודם", use_container_width=True):
@@ -365,7 +356,9 @@ elif st.session_state.page == "experiment_management":
     plant = plants[st.session_state.current_plant_idx]
     plant_id   = int(plant["id"])
     plant_name = str(plant["name"])
-    history    = load_diagnoses(plant_id)
+
+    with st.spinner("טוען היסטוריית אבחונים..."):
+        history = load_diagnoses(plant_id)
 
     st.markdown("<br>", unsafe_allow_html=True)
     with st.container(border=True):
@@ -375,24 +368,19 @@ elif st.session_state.page == "experiment_management":
         c3.metric("🧪 טיפול", str(plant.get("#Treatment", "—")))
         c4.metric("📉 עקה", f"{float(plant.get('stressDegree', 0)):.3f}")
 
-    # Status card
     treatment = plant.get("#Treatment", "")
     stress    = float(plant.get("stressDegree", 0))
     if treatment == "Drought" and stress > 0.15:
-        color, icon, msg = "#f44336", "⚠️", f"עקת יובש משמעותית (מדד: {stress:.3f})"
-        bg = "#fdf2f2"
+        color, icon, msg, bg = "#f44336", "⚠️", f"עקת יובש משמעותית (מדד: {stress:.3f})", "#fdf2f2"
     elif treatment == "Drought":
-        color, icon, msg = "#ff9800", "🔸", f"עקת יובש מתונה (מדד: {stress:.3f})"
-        bg = "#fffaf2"
+        color, icon, msg, bg = "#ff9800", "🔸", f"עקת יובש מתונה (מדד: {stress:.3f})", "#fffaf2"
     else:
-        color, icon, msg = "#2e7d32", "✅", "תקין — קבוצת ביקורת (Control)"
-        bg = "#f2fbf2"
+        color, icon, msg, bg = "#2e7d32", "✅", "תקין — קבוצת ביקורת (Control)", "#f2fbf2"
     st.markdown(f"""
     <div class="custom-card" style="border-right-color:{color};background:{bg}">
       {icon} <b>סטטוס פנוטיפי:</b> {msg}
     </div>""", unsafe_allow_html=True)
 
-    # Latest diagnosis summary
     if history:
         latest = history[-1]
         c_name = latest.get("class_name", "")
@@ -408,15 +396,11 @@ elif st.session_state.page == "experiment_management":
                 st.markdown(f"**💡 המלצות:** {DISEASE_INFO[c_name]['tip']}")
 
     st.divider()
-
-    # Full data table
     st.subheader("📋 נתוני הצמח המלאים")
-    display_plant = {k: v for k, v in plant.items() if k != "select_label"}
+    display_plant = {k: v for k, v in plant.items()}
     st.dataframe(pd.DataFrame([display_plant]), use_container_width=True, hide_index=True)
 
     st.divider()
-
-    # New diagnosis
     st.subheader("📸 הוספת אבחון חדש")
     with st.container(border=True):
         d1, d2 = st.columns(2, gap="medium")
@@ -430,25 +414,21 @@ elif st.session_state.page == "experiment_management":
 
         if img_file:
             image = Image.open(img_file).convert("RGB")
-            class_name, conf = run_model(image)
+            class_name, _ = run_model(image)
             if class_name is None:
                 auto_diag = "לא זוהה עלה רלוונטי"
                 class_name = "Unknown"
             else:
                 auto_diag = DISEASE_INFO.get(class_name, {"heb": class_name})["heb"]
             st.markdown(f"**🔍 תוצאת ניתוח:** {auto_diag}")
-
             if st.button("💾 שמור אבחון ל-MongoDB", use_container_width=True, type="primary"):
-                save_diagnosis(
-                    plant_id, plant_name, image, class_name, auto_diag,
-                    notes if notes else "לא הוכנס פירוט"
-                )
+                with st.spinner("שומר..."):
+                    save_diagnosis(plant_id, plant_name, image, class_name, auto_diag,
+                                   notes if notes else "לא הוכנס פירוט")
                 st.success("✅ נשמר בהצלחה ב-MongoDB Atlas!")
                 st.rerun()
 
     st.divider()
-
-    # History
     st.subheader(f"🗄️ היסטוריית אבחונים — {plant_name}")
     if history:
         for rec in reversed(history):
@@ -468,28 +448,26 @@ elif st.session_state.page == "experiment_management":
                     c_ref = rec.get("class_name", "")
                     if c_ref in DISEASE_INFO and c_ref != "HealthyLeaf":
                         st.info(f"💡 {DISEASE_INFO[c_ref]['tip']}")
-                    if st.button(f"🗑️ מחק רשומה זו", key=f"del_{rec['timestamp']}"):
+                    if st.button("🗑️ מחק רשומה זו", key=f"del_{rec['timestamp']}"):
                         delete_diagnosis(plant_id, rec["timestamp"])
                         st.success("הרשומה נמחקה.")
                         st.rerun()
     else:
-        st.info("אין עדיין אבחונים מתועדים לצמח זה.")
+        st.info("אין עדיין אבחונים לצמח זה.")
 
 # ─────────────────────────────────────────
-# ══════════  DATA MANAGEMENT  ══════════
+# DATA MANAGEMENT
 # ─────────────────────────────────────────
 
 elif st.session_state.page == "data_management":
     if st.button("🔙 חזרה לדף הבית", key="back3"):
         st.session_state.page = "home"; st.rerun()
-
     st.markdown("<h2 style='color:#6a1b9a'>⚙️ ניהול נתוני הניסוי</h2>", unsafe_allow_html=True)
     st.divider()
 
-    # ── Upload CSV ──
     st.subheader("📥 עדכון נתוני צמחים מ-CSV")
     with st.container(border=True):
-        st.write("העלה קובץ CSV חדש — הנתונים יוחלפו ב-MongoDB מיידית, ללא deploy מחדש.")
+        st.write("העלה קובץ CSV חדש — הנתונים יוחלפו ב-MongoDB מיידית, ללא deploy.")
         csv_file = st.file_uploader("בחר קובץ CSV", type=["csv"], key="csv_upload")
         if csv_file:
             df = pd.read_csv(csv_file)
@@ -498,67 +476,61 @@ elif st.session_state.page == "data_management":
             col_a, col_b = st.columns(2)
             with col_a:
                 if st.button("✅ אשר והעלה ל-MongoDB", type="primary", use_container_width=True):
-                    upsert_plants_from_df(df)
-                    st.success(f"✅ {len(df)} צמחים עודכנו ב-MongoDB בהצלחה!")
+                    with st.spinner("מעלה נתונים..."):
+                        upsert_plants_from_df(df)
+                    st.success(f"✅ {len(df)} צמחים עודכנו בהצלחה!")
                     st.balloons()
             with col_b:
                 if st.button("❌ ביטול", use_container_width=True):
                     st.rerun()
 
     st.divider()
-
-    # ── Current DB stats ──
     st.subheader("📊 סטטוס מסד הנתונים")
     with st.container(border=True):
+        with st.spinner("טוען סטטיסטיקות..."):
+            all_plants    = get_all_plants()
+            all_diagnoses = _post("find", "diagnoses",
+                                  {"sort": {"created_at": -1}, "limit": 1, "projection": {"timestamp": 1, "_id": 0}})
+            last_ts = (all_diagnoses.get("documents") or [{}])[0].get("timestamp", "אין")
         s1, s2, s3 = st.columns(3)
-        plant_count    = plants_col.count_documents({})
-        diagnosis_count = diagnoses_col.count_documents({})
-        last_diag = diagnoses_col.find_one({}, sort=[("created_at", -1)])
-        last_ts = last_diag["timestamp"] if last_diag else "אין"
-        s1.metric("🌱 צמחים ב-DB", plant_count)
-        s2.metric("🔬 סה\"כ אבחונים", diagnosis_count)
-        s3.metric("🕐 אבחון אחרון", last_ts)
+        s1.metric("🌱 צמחים ב-DB", len(all_plants))
+        s2.metric("🔬 אבחון אחרון", last_ts)
+        s3.metric("🔗 סטטוס חיבור", "✅ מחובר" if conn_status is True else "❌ שגיאה")
 
     st.divider()
-
-    # ── Export ──
     st.subheader("📤 ייצוא נתונים")
     with st.container(border=True):
         ec1, ec2 = st.columns(2)
         with ec1:
-            if st.button("📥 ייצא נתוני צמחים כ-CSV", use_container_width=True):
-                plants = get_all_plants()
-                if plants:
-                    df_export = pd.DataFrame(plants)
-                    csv_data = df_export.to_csv(index=False).encode("utf-8")
-                    st.download_button("⬇️ הורד plants.csv", csv_data,
-                                       "plants.csv", "text/csv", use_container_width=True)
+            if st.button("📥 ייצא צמחים כ-CSV", use_container_width=True):
+                plants_exp = get_all_plants()
+                if plants_exp:
+                    csv_data = pd.DataFrame(plants_exp).to_csv(index=False).encode("utf-8")
+                    st.download_button("⬇️ הורד plants.csv", csv_data, "plants.csv", "text/csv", use_container_width=True)
                 else:
-                    st.warning("אין נתונים לייצוא.")
+                    st.warning("אין נתונים.")
         with ec2:
-            if st.button("📥 ייצא היסטוריית אבחונים כ-CSV", use_container_width=True):
-                all_diag = list(diagnoses_col.find({}, {"_id": 0, "image_b64": 0}))
-                if all_diag:
-                    df_diag = pd.DataFrame(all_diag)
-                    csv_diag = df_diag.to_csv(index=False).encode("utf-8")
-                    st.download_button("⬇️ הורד diagnoses.csv", csv_diag,
-                                       "diagnoses.csv", "text/csv", use_container_width=True)
+            if st.button("📥 ייצא אבחונים כ-CSV", use_container_width=True):
+                all_d = _post("find", "diagnoses",
+                              {"limit": 1000, "projection": {"image_b64": 0, "_id": 0}})
+                docs = all_d.get("documents", [])
+                if docs:
+                    csv_diag = pd.DataFrame(docs).to_csv(index=False).encode("utf-8")
+                    st.download_button("⬇️ הורד diagnoses.csv", csv_diag, "diagnoses.csv", "text/csv", use_container_width=True)
                 else:
-                    st.warning("אין אבחונים לייצוא.")
+                    st.warning("אין אבחונים.")
 
     st.divider()
-
-    # ── Danger zone ──
     with st.expander("🔴 אזור מסוכן — מחיקת נתונים"):
         st.warning("פעולות אלו בלתי הפיכות!")
         d1, d2 = st.columns(2)
         with d1:
             if st.button("🗑️ מחק את כל האבחונים", use_container_width=True):
-                diagnoses_col.delete_many({})
+                _post("deleteMany", "diagnoses", {"filter": {}})
                 st.success("כל האבחונים נמחקו.")
                 st.rerun()
         with d2:
             if st.button("🗑️ מחק את כל נתוני הצמחים", use_container_width=True):
-                plants_col.delete_many({})
+                _post("deleteMany", "plants", {"filter": {}})
                 st.success("כל נתוני הצמחים נמחקו.")
                 st.rerun()
